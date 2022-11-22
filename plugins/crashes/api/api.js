@@ -1476,33 +1476,66 @@ plugins.setConfigs("crashes", {
             validateDelete(obParams, FEATURE_NAME, function() {
                 var params = obParams;
                 var crashes = params.qstring.args.crashes || [params.qstring.args.crash_id];
+                var errCount = 0;
                 common.db.collection('app_crashgroups' + params.qstring.app_id).find({'_id': {$in: crashes}}).toArray(function(err, groups) {
                     if (groups) {
                         var inc = {};
-                        async.each(groups, function(group, done) {
+                        async.each(groups, async function(group) {
                             group.app_id = params.qstring.app_id;
                             plugins.dispatch("/systemlogs", {params: params, action: "crash_deleted", data: group});
-                            common.db.collection('app_crashes' + params.qstring.app_id).remove({'group': {$in: group.groups} }, function() {});
-                            common.db.collection('app_crashgroups' + params.qstring.app_id).remove({'_id': group._id }, function() {});
+                            try {
+                                await common.db.collection('app_crashes' + params.qstring.app_id).remove({'group': {$in: group.groups} });
+                                await common.db.collection('app_crashgroups' + params.qstring.app_id).remove({'_id': group._id });
+                            }
+                            catch (error) {
+                                errCount += 1;
+                            }
+
                             if (common.drillDb) {
-                                common.drillDb.collection("drill_events" + crypto.createHash('sha1').update("[CLY]_crash" + params.qstring.app_id).digest('hex')).remove({"sg.crash": group._id}, function() {});
+                                try {
+                                    await common.drillDb.collection("drill_events" + crypto.createHash('sha1').update("[CLY]_crash" + params.qstring.app_id).digest('hex')).remove({"sg.crash": group._id});
+                                }
+                                catch (error) {
+                                    errCount += 1;
+                                }
+
                                 plugins.dispatch("/crash/delete", {appId: params.qstring.app_id, crash: group._id + ""});
                             }
                             var id = common.crypto.createHash('sha1').update(params.qstring.app_id + group._id + "").digest('hex');
-                            common.db.collection('crash_share').remove({'_id': id }, function() {});
+                            try {
+                                await common.db.collection('crash_share').remove({'_id': id });
+                            }
+                            catch (error) {
+                                errCount += 1;
+                            }
+
                             common.db.collection('app_crashusers' + params.qstring.app_id).find({"group": {$in: group.groups}}, {reports: 1, uid: 1, _id: 0}).toArray(function(crashUsersErr, users) {
+                                if (crashUsersErr) {
+                                    errCount += 1;
+                                }
+
                                 var uids = [];
                                 for (let i = 0; i < users.length; i++) {
                                     if (users[i].reports > 0) {
                                         uids.push(users[i].uid);
                                     }
                                 }
-                                common.db.collection('app_crashusers' + params.qstring.app_id).remove({"group": {$in: group.groups}}, function() {});
+
+                                try {
+                                    common.db.collection('app_crashusers' + params.qstring.app_id).remove({"group": {$in: group.groups}});
+                                }
+                                catch (error) {
+                                    errCount += 1;
+                                }
+
                                 var mod = {crashes: -1};
                                 if (!group.nonfatal) {
                                     mod.fatal = -1;
                                 }
-                                common.db.collection('app_crashusers' + params.qstring.app_id).update({"group": 0, uid: {$in: uids}}, {$inc: mod}, {multi: true}, function() {
+                                common.db.collection('app_crashusers' + params.qstring.app_id).update({"group": 0, uid: {$in: uids}}, {$inc: mod}, {multi: true}, function(errCrashUsers) {
+                                    if (errCrashUsers) {
+                                        errCount += 1;
+                                    }
                                     if (!inc.crashes) {
                                         inc.crashes = 0;
                                     }
@@ -1571,7 +1604,6 @@ plugins.setConfigs("crashes", {
                                             inc["app_version." + i] -= group.app_version[i];
                                         }
                                     }
-                                    done();
                                 });
                             });
                         }, function() {
@@ -1586,7 +1618,12 @@ plugins.setConfigs("crashes", {
                                         update.$inc = inc;
                                     }
                                     common.db.collection('app_crashgroups' + params.qstring.app_id).update({_id: "meta"}, update, function() {});
-                                    common.returnMessage(params, 200, 'Success');
+                                    if (errCount > 0) {
+                                        common.returnMessage(params, 200, 'Some deletions failed');
+                                    }
+                                    else {
+                                        common.returnMessage(params, 200, 'Success');
+                                    }
                                 });
                             });
                         });
