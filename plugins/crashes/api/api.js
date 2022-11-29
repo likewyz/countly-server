@@ -9,6 +9,7 @@ var plugin = {},
     Promise = require("bluebird"),
     trace = require("./parts/stacktrace.js"),
     plugins = require('../../pluginManager.js'),
+    log = common.log('crashes:api'),
     { validateCreate, validateRead, validateUpdate, validateDelete } = require('../../../api/utils/rights.js');
 
 const FEATURE_NAME = 'crashes';
@@ -1476,7 +1477,7 @@ plugins.setConfigs("crashes", {
             validateDelete(obParams, FEATURE_NAME, function() {
                 var params = obParams;
                 var crashes = params.qstring.args.crashes || [params.qstring.args.crash_id];
-                var errCount = 0;
+                var failedCrashNames = [];
                 common.db.collection('app_crashgroups' + params.qstring.app_id).find({'_id': {$in: crashes}}).toArray(function(err, groups) {
                     if (groups) {
                         var inc = {};
@@ -1485,10 +1486,17 @@ plugins.setConfigs("crashes", {
                             plugins.dispatch("/systemlogs", {params: params, action: "crash_deleted", data: group});
                             try {
                                 await common.db.collection('app_crashes' + params.qstring.app_id).remove({'group': {$in: group.groups} });
+                            }
+                            catch (error) {
+                                log.e("Crashes deletion failed " + group.groups, error);
+                            }
+
+                            try {
                                 await common.db.collection('app_crashgroups' + params.qstring.app_id).remove({'_id': group._id });
                             }
                             catch (error) {
-                                errCount += 1;
+                                failedCrashNames.push(group.name);
+                                log.e("Crashgroup deletion failed", error);
                             }
 
                             if (common.drillDb) {
@@ -1496,7 +1504,7 @@ plugins.setConfigs("crashes", {
                                     await common.drillDb.collection("drill_events" + crypto.createHash('sha1').update("[CLY]_crash" + params.qstring.app_id).digest('hex')).remove({"sg.crash": group._id});
                                 }
                                 catch (error) {
-                                    errCount += 1;
+                                    log.e("Drill Event deletion failed " + group._id, error);
                                 }
 
                                 plugins.dispatch("/crash/delete", {appId: params.qstring.app_id, crash: group._id + ""});
@@ -1506,14 +1514,10 @@ plugins.setConfigs("crashes", {
                                 await common.db.collection('crash_share').remove({'_id': id });
                             }
                             catch (error) {
-                                errCount += 1;
+                                log.e("Crash Share deletion failed " + id, error);
                             }
 
                             common.db.collection('app_crashusers' + params.qstring.app_id).find({"group": {$in: group.groups}}, {reports: 1, uid: 1, _id: 0}).toArray(function(crashUsersErr, users) {
-                                if (crashUsersErr) {
-                                    errCount += 1;
-                                }
-
                                 var uids = [];
                                 for (let i = 0; i < users.length; i++) {
                                     if (users[i].reports > 0) {
@@ -1525,16 +1529,16 @@ plugins.setConfigs("crashes", {
                                     common.db.collection('app_crashusers' + params.qstring.app_id).remove({"group": {$in: group.groups}});
                                 }
                                 catch (error) {
-                                    errCount += 1;
+                                    log.e("Crash Users deletion failed " + group.groups, error);
                                 }
 
                                 var mod = {crashes: -1};
                                 if (!group.nonfatal) {
                                     mod.fatal = -1;
                                 }
-                                common.db.collection('app_crashusers' + params.qstring.app_id).update({"group": 0, uid: {$in: uids}}, {$inc: mod}, {multi: true}, function(errCrashUsers) {
-                                    if (errCrashUsers) {
-                                        errCount += 1;
+                                common.db.collection('app_crashusers' + params.qstring.app_id).update({"group": 0, uid: {$in: uids}}, {$inc: mod}, {multi: true}, function(crashUsersUpdateErr) {
+                                    if (crashUsersUpdateErr) {
+                                        log.e("Crash Users update failed " + uids, crashUsersUpdateErr);
                                     }
                                     if (!inc.crashes) {
                                         inc.crashes = 0;
@@ -1618,8 +1622,8 @@ plugins.setConfigs("crashes", {
                                         update.$inc = inc;
                                     }
                                     common.db.collection('app_crashgroups' + params.qstring.app_id).update({_id: "meta"}, update, function() {});
-                                    if (errCount > 0) {
-                                        common.returnMessage(params, 200, 'Some deletions failed');
+                                    if (failedCrashNames.length > 0) {
+                                        common.returnMessage(params, 200, failedCrashNames);
                                     }
                                     else {
                                         common.returnMessage(params, 200, 'Success');
